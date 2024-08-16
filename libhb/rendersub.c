@@ -470,6 +470,101 @@ static void ApplySub(const hb_filter_private_t *pv, hb_buffer_t *buf, const hb_b
     pv->blend(buf, sub, sub->f.x, sub->f.y, pv->depth - 8);
 }
 
+static void SubsampleBlend8on8(const hb_filter_private_t *pv, hb_buffer_t *dst, const hb_buffer_t *src, const int left, const int top, const int shift)
+{
+    int x0, y0, x0c, y0c;
+    int xx, yy, ox, oy;
+    int width, height;
+    uint8_t *y_in, *y_out;
+    uint8_t *u_in, *u_out;
+    uint8_t *v_in, *v_out;
+    uint8_t *a_in;
+
+    x0 = left;
+    y0 = top;
+
+    //Coordinates of the first chroma sample affected by the overlay
+    x0c = x0 & ~((1 << pv->wshift) - 1);
+    y0c = y0 & ~((1 << pv->hshift) - 1);
+
+    width  = (src->f.width  - x0 <= dst->f.width - left) ? src->f.width  : (dst->f.width - left + x0);
+    height = (src->f.height - y0 <= dst->f.height - top) ? src->f.height : (dst->f.height - top + y0);
+
+    y_out = dst->plane[0].data + y0c * dst->plane[0].stride;
+    u_out = dst->plane[1].data + (y0c >> pv->hshift) * dst->plane[1].stride;
+    v_out = dst->plane[2].data + (y0c >> pv->hshift) * dst->plane[2].stride;
+
+
+    // This is setting the pointer outside of the array range if y0c < y0
+    oy = y0c - y0;
+    y_in = src->plane[0].data + oy * src->plane[0].stride;
+    u_in = src->plane[1].data + oy * src->plane[1].stride;
+    v_in = src->plane[2].data + oy * src->plane[2].stride;
+    a_in = src->plane[3].data + oy * src->plane[3].stride;
+
+    unsigned isChromaLine, resU, resV, alpha;
+    unsigned accuA, accuB, accuC, coeff;
+    for (yy = y0c; oy < height; oy = ++yy - y0)
+    {
+        ox = x0c - x0;
+        isChromaLine = yy == (yy & ~((1 << pv->hshift) - 1));
+        for (xx = x0c; ox < width; ox = ++xx - x0)
+        {
+            if (ox >= 0 && oy >= 0)
+            {
+                y_out[xx] = ( y_out[xx] * ( 255 - a_in[ox] ) + y_in[ox] * a_in[ox] + 127 ) / 255;
+            }
+
+            if (isChromaLine && xx == (xx & ~((1 << pv->wshift) - 1)))
+            {
+                //perform chromaloc-aware subsampling and blending
+                accuA = accuB = accuC = 0;
+                for (int yz = 0, oyz = oy; yz < (1 << pv->hshift); yz++, oyz++)
+                {
+                    for (int xz = 0, oxz = ox; xz < (1 << pv->wshift); xz++, oxz++)
+                    {
+                        //weight of the current chroma sample
+                        coeff = pv->chromaCoeffs[0][xz]*pv->chromaCoeffs[1][yz];
+                        resU = u_out[xx >> pv->wshift];
+                        resV = v_out[xx >> pv->wshift];
+
+                        //chroma sampled area overlap with bitmap
+                        if (oxz >= 0 && oyz >= 0)
+                        {
+                            alpha = a_in[oxz + yz*src->plane[3].stride];
+                            resU *= (255 - alpha);
+                            resU = (resU + (u_in + yz*src->plane[1].stride)[oxz] * alpha + 127) / 255;
+
+                            resV *= (255 - alpha);
+                            resV = (resV + (v_in + yz*src->plane[2].stride)[oxz] * alpha + 127) / 255;
+                        }
+
+                        //accumulate
+                        accuA += coeff*resU;
+                        accuB += coeff*resV;
+                        accuC += coeff;
+                    }
+                }
+                if (accuC)
+                {
+                    u_out[xx >> pv->wshift] = (accuA + (accuC>>1))/accuC;
+                    v_out[xx >> pv->wshift] = (accuB + (accuC>>1))/accuC;
+                }
+            }
+        }
+        if (isChromaLine)
+        {
+            u_out += dst->plane[1].stride;
+            v_out += dst->plane[2].stride;
+        }
+        y_out+= dst->plane[0].stride;
+        y_in += src->plane[0].stride;
+        u_in += src->plane[1].stride;
+        v_in += src->plane[2].stride;
+        a_in += src->plane[3].stride;
+    }
+}
+
 static hb_buffer_t * ScaleSubtitle(hb_filter_private_t *pv,
                                    hb_buffer_t *sub, hb_buffer_t *buf)
 {
@@ -504,8 +599,8 @@ static hb_buffer_t * ScaleSubtitle(hb_filter_private_t *pv,
 
         width       = sub->f.width  * xfactor;
         height      = sub->f.height * yfactor;
-        // Note that subtitle frame buffer is YUVA420P, not YUV420P, it has alpha
-        scaled      = hb_frame_buffer_init(AV_PIX_FMT_YUVA420P, width, height);
+        // Note that subtitle frame buffer has alpha and should always be 444P
+        scaled      = hb_frame_buffer_init(sub->f.fmt, width, height);
         if (scaled == NULL)
             return NULL;
 
@@ -643,7 +738,7 @@ static void ApplyVOBSubs( hb_filter_private_t * pv, hb_buffer_t * buf )
             {
                 hb_buffer_t *scaled = ScaleSubtitle(pv, sub, buf);
                 ApplySub( pv, buf, scaled );
-                hb_buffer_close(&scaled);
+                hb_buffer_close( &scaled );
                 sub = sub->next;
             }
             ii++;
@@ -837,73 +932,6 @@ static hb_buffer_t* ComposeSubsampleASS( hb_filter_private_t *pv, const ASS_Imag
     free(compo);
     return sub;
 }
-
-// To enable and use with bitmap subtitles
-#if 0
-// Output a YUVA4**P frame from a YUVA444P8 frame
-static hb_buffer_t * SubsampleOverlay(const hb_filter_private_t *pv, const hb_buffer_t *overlay)
-{
-    hb_buffer_t *sub = hb_frame_buffer_init( pv->pix_fmt_alpha, overlay->f.width, overlay->f.height );
-    if ( !sub )
-    {
-        return NULL;
-    }
-    sub->f.x = overlay->f.x;
-    sub->f.y = overlay->f.y;
-
-    uint8_t *y_out, *u_out, *v_out, *a_out, *pA_in, *pB_in;
-    y_out = sub->plane[0].data;
-    u_out = sub->plane[1].data;
-    v_out = sub->plane[2].data;
-    a_out = sub->plane[3].data;
-
-    //process YA
-    pA_in = overlay->plane[0].data;
-    pB_in = overlay->plane[3].data;
-    for (int yy = 0; yy < overlay->f.height; yy++)
-    {
-        memcpy(y_out, pA_in, overlay->f.width);
-        memcpy(a_out, pB_in, overlay->f.width);
-        y_out += sub->plane[0].stride;
-        a_out += sub->plane[3].stride;
-        pA_in += overlay->plane[0].stride;
-        pB_in += overlay->plane[3].stride;
-    }
-
-    unsigned int accuA, accuB, accuC;
-    unsigned int coeff;
-
-    //process UV
-    pA_in = overlay->plane[1].data;
-    pB_in = overlay->plane[2].data;
-    a_out = sub->plane[3].data;
-    for (int yy = 0; yy < overlay->f.height >> pv->hshift; yy++)
-    {
-        for (int xx = 0, xo = 0; xx < overlay->f.width >> pv->wshift; xx++, xo = xx << pv->wshift)
-        {
-            accuA = accuB = accuC = 0;
-            for (int yz = 0; yz < (1 << pv->hshift); yz++) {
-                for (int xz = 0; xz < (1 << pv->wshift); xz++) {
-                    coeff = pv->chromaCoeffs[0][xz]*pv->chromaCoeffs[1][yz]*(a_out + yz*sub->plane[3].stride)[xo + xz];
-                    accuA += coeff*(pA_in + yz*overlay->plane[1].stride)[xo + xz];
-                    accuB += coeff*(pB_in + yz*overlay->plane[2].stride)[xo + xz];
-                    accuC += coeff;
-                }
-            }
-            if (accuC) {
-                u_out[xx] = (accuA + (accuC - 1))/accuC;
-                v_out[xx] = (accuB + (accuC - 1))/accuC;
-            }
-        }
-        u_out += sub->plane[1].stride;
-        v_out += sub->plane[2].stride;
-        a_out += sub->plane[3].stride << pv->hshift;
-        pA_in += overlay->plane[1].stride << pv->hshift;
-        pB_in += overlay->plane[2].stride << pv->hshift;
-    }
-    return sub;
-}
-#endif
 
 static void ApplySSASubs( hb_filter_private_t * pv, hb_buffer_t * buf )
 {
@@ -1299,8 +1327,11 @@ static void ApplyPGSSubs( hb_filter_private_t * pv, hb_buffer_t * buf )
         if ( sub->s.start <= buf->s.start )
         {
             hb_buffer_t *scaled = ScaleSubtitle(pv, sub, buf);
-            ApplySub( pv, buf, scaled );
-            hb_buffer_close(&scaled);
+            if ( scaled )
+            {
+                SubsampleBlend8on8( pv, buf, scaled, scaled->f.x, scaled->f.y, 0 );
+                hb_buffer_close( &scaled );
+            }
         }
     }
 }
